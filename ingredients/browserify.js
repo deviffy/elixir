@@ -1,75 +1,101 @@
-var utilities = require('./commands/Utilities');
-var source = require('vinyl-source-stream');
-var parsePath = require('parse-filepath');
-var browserify = require('browserify');
-var elixir = require('laravel-elixir');
-var babelify = require('babelify');
 var gulp = require('gulp');
-
-
-/**
- * Calculate the correct destination.
- *
- * @param {string} output
- */
-var getDestination = function(output) {
-    output = parsePath(output);
-
-    var saveDir = output.extname
-        ? output.dirname
-        : (output.dirname + '/' + output.basename);
-
-    var saveFile = output.extname ? output.basename : 'bundle.js';
-
-    return {
-        saveFile: saveFile,
-        saveDir: saveDir
-    }
-};
+var elixir = require('laravel-elixir');
+var config = elixir.config;
+var inSequence = require('run-sequence');
+var utilities = require('./commands/Utilities');
+var notifications = require('./commands/Notification');
+var gulpIf = require('gulp-if');
+var uglify = require('gulp-uglify');
+var rename = require('gulp-rename');
+var source = require('vinyl-source-stream');
+var buffer = require('vinyl-buffer');
+var browserify = require('browserify');
+var watchify = require('watchify');
+var _  = require('underscore');
 
 /**
- * Build the Gulp task.
+ * Create the Gulp task.
  *
- * @param {array}  src
- * @param {string} output
- * @param {object} options
+ * @return {void}
  */
-var buildTask = function(src, output, options) {
-    var destination = getDestination(output);
+var buildTask = function() {
+    var stream;
 
     gulp.task('browserify', function() {
-        return browserify(src, options)
-            .transform(babelify, { stage: 0 })
-            .bundle()
-            .pipe(source(destination.saveFile))
-            .pipe(gulp.dest(destination.saveDir));
+        var onError = function(e) {
+            new notifications().error(e, 'Browserify Compilation Failed!');
+            this.emit('end');
+        };
+
+        var bundle = function(b, instance) {
+            return b.bundle()
+                .on('error', onError)
+                .pipe(source(instance.src.split("/").pop()))
+                .pipe(buffer())
+                .pipe(gulpIf(!instance.options.debug, uglify()))
+                .pipe(gulpIf(typeof instance.options.rename === 'string', rename(instance.options.rename)))
+                .pipe(gulp.dest(instance.options.output))
+                .pipe(new notifications().message('Browserified!'));
+        };
+
+        config.toBrowserify.forEach(function(instance) {
+            var b = browserify(instance.src, instance.options);
+
+            if (config.watchify) {
+                b = watchify(b);
+
+                b.on('update', function() {
+                    bundle(b, instance);
+                });
+            }
+
+            stream = bundle(b, instance);
+        });
+
+        return stream;
     });
 };
 
-
-/*
- |----------------------------------------------------------------
- | Browserify Task
- |----------------------------------------------------------------
- |
- | This task will manage your entire Browserify workflow, from
- | scratch! Also, it will channel all files through Babelify
- | so that you may use all the ES6 goodness you can stand.
- |
+/**
+ * Create elixir extension
  */
+elixir.extend('browserify', function (src, options) {
+    if (!_.isArray(config.toBrowserify)) {
+        config.toBrowserify = [];
+    }
 
-elixir.extend('browserify', function(src, output, baseDir, options) {
-    var search = '/**/*.+(js|jsx|babel)';
+    options = _.extend({
+        debug:         ! config.production,
+        rename:        null,
+        srcDir:        config.assetsDir + 'js',
+        output:        config.jsOutput,
+        transform:     [],
+        insertGlobals: false
+    }, options);
 
-    baseDir = baseDir || 'resources/js';
-    src = utilities.buildGulpSrc(src, './' + baseDir, search);
-    output = output || this.jsOutput;
-    options = options || {};
+    config.toBrowserify.push({
+        src : "./" + utilities.buildGulpSrc(src, options.srcDir),
+        options: options
+    });
 
-    utilities.logTask('Running Browserify', src);
+    buildTask();
 
-    buildTask(src, output, options);
+    this.registerWatcher('browserify', options.srcDir + '/**/*.js', config.watchify ? 'nowatch' : 'default');
 
-    return this.registerWatcher('browserify', baseDir + search)
-               .queueTask('browserify');
+    return this.queueTask('browserify');
+});
+
+/**
+ * Create elixir extension for Watchify command
+ */
+elixir.extend('watchify', function() {
+    var config = this;
+
+    gulp.task('watchify', ['watch'], function() {
+        config.watchify = true;
+
+        inSequence.apply(this, ['browserify']);
+    });
+
+    return this.queueTask('watchify');
 });
